@@ -16,6 +16,7 @@ import gspread
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
+# Header Definitions
 SLEEP_HEADERS = [
     "date",
     "sleep_start_timestamp_local",
@@ -55,6 +56,21 @@ ACT_HEADERS = [
 STRESS_HEADERS = ["date_hour", "min_stress", "max_stress", "avg_stress"]
 HR_HEADERS = ["date_hour", "min_hr", "max_hr", "avg_hr"]
 STEPS_HEADERS = ["date_hour", "total_steps"]
+
+SNAPSHOTS_HEADERS = [
+    "snapshot_id",
+    "timestamp_local",
+    "avg_hr",
+    "avg_stress",
+    "avg_respiration",
+    "spo2",
+    "rmssd",
+    "sdnn",
+]
+STAGES_HEADERS = ["start_time_local", "end_time_local", "stage", "duration_seconds"]
+MOVEMENT_HEADERS = ["timestamp_local", "movement_intensity"]
+BREATHING_HEADERS = ["timestamp_local", "respiration_rate"]
+RESTLESS_HEADERS = ["timestamp_local", "restless_level"]
 
 
 def get_garmin_client() -> Garmin:
@@ -121,6 +137,41 @@ def to_date_hour(ts):
     return None
 
 
+def sync_sheet(sh, title, headers):
+    try:
+        ws = sh.worksheet(title)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=title, rows="100", cols="20")
+
+    existing = ws.row_values(1)
+    if not existing:
+        ws.append_row(headers)
+        col_a = [headers[0]]
+    else:
+        col_a = [str(x) for x in ws.col_values(1)]
+
+    return ws, col_a
+
+
+def upsert_data(ws, col_a, row_data_dict, headers):
+    new_rows = []
+    end_col = chr(ord("A") + len(headers) - 1)
+
+    for key in sorted(row_data_dict.keys()):
+        row_vals = row_data_dict[key]
+        if key in col_a:
+            idx = col_a.index(key) + 1
+            ws.update(f"A{idx}:{end_col}{idx}", [row_vals])
+            logging.info(f"Updated {ws.title} for key {key}")
+        else:
+            new_rows.append(row_vals)
+            col_a.append(key)
+
+    if new_rows:
+        ws.append_rows(new_rows)
+        logging.info(f"Appended {len(new_rows)} new rows to {ws.title}")
+
+
 def parse_sleep_row(target_date: str, sleep_data: dict) -> list:
     dto = (sleep_data or {}).get("dailySleepDTO")
     if not dto:
@@ -171,6 +222,115 @@ def parse_act_row(act: dict) -> list:
         "elevation_gain_meters": act.get("elevationGain"),
     }
     return [row_dict.get(h) if row_dict.get(h) is not None else "" for h in ACT_HEADERS]
+
+
+def fetch_health_snapshots(garmin, dates):
+    rows = {}
+    for dt in dates:
+        date_str = dt.strftime("%Y-%m-%d")
+        try:
+            if hasattr(garmin, "get_health_snapshot"):
+                data = garmin.get_health_snapshot(date_str)
+            else:
+                data = garmin.connectapi(f"/healthsnapshot-service/snapshot/daily/{date_str}")
+        except Exception as e:
+            logging.error(f"Error fetching health snapshots for {date_str}: {e}")
+            continue
+
+        snapshots = data if isinstance(data, list) else (data.get("summaries") or data.get("snapshotList") or [])
+        for item in snapshots:
+            if isinstance(item, dict):
+                snap_id = str(item.get("snapshotId") or item.get("summaryId") or item.get("startTimestampLocal") or item.get("startTimestampGMT"))
+                if not snap_id:
+                    continue
+
+                ts = item.get("startTimestampLocal") or item.get("startTimestampGMT") or item.get("startTimeLocal")
+                avg_hr = item.get("averageHeartRate") or item.get("avgHeartRate")
+                avg_stress = item.get("averageStress") or item.get("avgStress")
+                avg_resp = item.get("averageRespiration") or item.get("avgRespiration")
+                spo2 = item.get("spo2") or item.get("averageSpo2")
+                rmssd = item.get("rmssd") or item.get("hrvRmssd")
+                sdnn = item.get("sdnn") or item.get("hrvSdnn")
+
+                rows[snap_id] = [
+                    snap_id,
+                    ts or "",
+                    avg_hr if avg_hr is not None else "",
+                    avg_stress if avg_stress is not None else "",
+                    avg_resp if avg_resp is not None else "",
+                    spo2 if spo2 is not None else "",
+                    rmssd if rmssd is not None else "",
+                    sdnn if sdnn is not None else "",
+                ]
+    return rows
+
+
+def process_sub_sleep_data(garmin, dates):
+    stages_rows, movement_rows, breathing_rows, restless_rows = {}, {}, {}, {}
+
+    for dt in dates:
+        date_str = dt.strftime("%Y-%m-%d")
+        try:
+            data = garmin.get_sleep_data(date_str) or {}
+        except Exception as e:
+            logging.error(f"Error fetching detailed sleep for {date_str}: {e}")
+            continue
+
+        # 1. Stages
+        levels_map = data.get("sleepLevels") or (data.get("dailySleepDTO") or {}).get("sleepLevels") or {}
+        stage_items = []
+        if isinstance(levels_map, dict):
+            for stage_name, items in levels_map.items():
+                if isinstance(items, list):
+                    for it in items:
+                        if isinstance(it, dict):
+                            it_copy = dict(it)
+                            it_copy["stage"] = stage_name
+                            stage_items.append(it_copy)
+        elif isinstance(levels_map, list):
+            stage_items = levels_map
+
+        for it in stage_items:
+            if isinstance(it, dict):
+                start = it.get("startLocal") or it.get("startTimeLocal") or it.get("startGMT")
+                end = it.get("endLocal") or it.get("endTimeLocal") or it.get("endGMT")
+                stage = it.get("stage") or it.get("activityLevel") or it.get("level") or "unknown"
+                dur = it.get("durationInSeconds") or it.get("duration") or 0
+                if start:
+                    key = str(start)
+                    stages_rows[key] = [key, end or "", stage, dur]
+
+        # 2. Movement
+        movements = data.get("sleepMovement") or data.get("sleepMovementValues") or (data.get("dailySleepDTO") or {}).get("sleepMovement") or []
+        for it in movements if isinstance(movements, list) else []:
+            if isinstance(it, dict):
+                ts = it.get("startGMT") or it.get("startLocal") or it.get("timestamp")
+                val = it.get("activityLevel") or it.get("value") or 0
+                if ts:
+                    key = str(ts)
+                    movement_rows[key] = [key, val]
+
+        # 3. Breathing Disruption
+        resp = data.get("sleepRespiration") or data.get("respirationValues") or data.get("epochRespiration") or []
+        for it in resp if isinstance(resp, list) else []:
+            if isinstance(it, dict):
+                ts = it.get("startGMT") or it.get("startLocal") or it.get("timestamp")
+                val = it.get("respirationRate") or it.get("value") or it.get("epochValue")
+                if ts and val is not None:
+                    key = str(ts)
+                    breathing_rows[key] = [key, val]
+
+        # 4. Restless Moments
+        restless = data.get("restlessMoments") or data.get("sleepRestlessMoments") or (data.get("dailySleepDTO") or {}).get("restlessMoments") or []
+        for it in restless if isinstance(restless, list) else []:
+            if isinstance(it, dict):
+                ts = it.get("startGMT") or it.get("startLocal") or it.get("timestamp")
+                val = it.get("duration") or it.get("value") or 1
+                if ts:
+                    key = str(ts)
+                    restless_rows[key] = [key, val]
+
+    return stages_rows, movement_rows, breathing_rows, restless_rows
 
 
 def process_stress_data(garmin, dates):
@@ -245,13 +405,7 @@ def process_steps_data(garmin, dates):
             logging.error(f"Error fetching steps for {date_str}: {e}")
             continue
 
-        if isinstance(data, dict):
-            raw = data.get("stepItems") or data.get("stepsValuesArray") or []
-        elif isinstance(data, list):
-            raw = data
-        else:
-            raw = []
-
+        raw = data if isinstance(data, list) else (data.get("stepItems") or data.get("stepsValuesArray") or [])
         for item in raw:
             ts, steps = None, 0
             if isinstance(item, (list, tuple)) and len(item) >= 2:
@@ -271,41 +425,6 @@ def process_steps_data(garmin, dates):
     return rows
 
 
-def sync_sheet(sh, title, headers):
-    try:
-        ws = sh.worksheet(title)
-    except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=title, rows="100", cols="20")
-
-    existing = ws.row_values(1)
-    if not existing:
-        ws.append_row(headers)
-        col_a = [headers[0]]
-    else:
-        col_a = [str(x) for x in ws.col_values(1)]
-
-    return ws, col_a
-
-
-def upsert_hourly_data(ws, col_a, row_data_dict, headers):
-    new_rows = []
-    end_col = chr(ord("A") + len(headers) - 1)
-
-    for dh in sorted(row_data_dict.keys()):
-        row_vals = row_data_dict[dh]
-        if dh in col_a:
-            idx = col_a.index(dh) + 1
-            ws.update(f"A{idx}:{end_col}{idx}", [row_vals])
-            logging.info(f"Updated {ws.title} for {dh}")
-        else:
-            new_rows.append(row_vals)
-            col_a.append(dh)
-
-    if new_rows:
-        ws.append_rows(new_rows)
-        logging.info(f"Appended {len(new_rows)} new hourly rows to {ws.title}")
-
-
 def main():
     spreadsheet_id = os.environ.get("SPREADSHEET_ID")
     if not spreadsheet_id:
@@ -316,36 +435,36 @@ def main():
     sh = gc.open_by_key(spreadsheet_id)
     today = date.today()
 
-    # 1. Prepare Sleep sheet
+    # 1. Prepare Sheets
     sleep_ws, sleep_col_a = sync_sheet(sh, os.environ.get("SHEET_NAME", "Sleep"), SLEEP_HEADERS)
-    sleep_count = max(0, len(sleep_col_a) - 1)
-    sleep_candidates = [today] if sleep_count >= 60 else [today - timedelta(days=i) for i in range(59, -1, -1)]
-    sleep_dates_needed = [dt for dt in sleep_candidates if dt.strftime("%Y-%m-%d") not in sleep_col_a]
-
-    # 2. Prepare Activities sheet
     act_ws, act_col_a = sync_sheet(sh, os.environ.get("ACTIVITIES_SHEET_NAME", "Activities"), ACT_HEADERS)
-    act_count = max(0, len(act_col_a) - 1)
-    act_start = today - timedelta(days=1 if act_count >= 60 else 59)
-
-    # 3. Prepare Hourly Sheets (Stress, HR, Steps)
     stress_ws, stress_col_a = sync_sheet(sh, os.environ.get("STRESS_SHEET_NAME", "Stress"), STRESS_HEADERS)
     hr_ws, hr_col_a = sync_sheet(sh, os.environ.get("HR_SHEET_NAME", "HR"), HR_HEADERS)
     steps_ws, steps_col_a = sync_sheet(sh, os.environ.get("STEPS_SHEET_NAME", "Steps"), STEPS_HEADERS)
+    snap_ws, snap_col_a = sync_sheet(sh, os.environ.get("SNAPSHOTS_SHEET_NAME", "Snapshots"), SNAPSHOTS_HEADERS)
+    stages_ws, stages_col_a = sync_sheet(sh, os.environ.get("STAGES_SHEET_NAME", "Sleep stages"), STAGES_HEADERS)
+    move_ws, move_col_a = sync_sheet(sh, os.environ.get("MOVEMENT_SHEET_NAME", "Sleep Movement"), MOVEMENT_HEADERS)
+    breath_ws, breath_col_a = sync_sheet(sh, os.environ.get("BREATHING_SHEET_NAME", "Breathing Disruption"), BREATHING_HEADERS)
+    restless_ws, restless_col_a = sync_sheet(sh, os.environ.get("RESTLESS_SHEET_NAME", "Restless Moments"), RESTLESS_HEADERS)
 
-    # Determine hourly fetch dates (7 days backfill if new sheet, else yesterday + today)
-    def get_hourly_dates(col_a):
-        return [today - timedelta(days=i) for i in range(6, -1, -1)] if len(col_a) < 24 else [today - timedelta(days=1), today]
+    # Date Window Helper
+    def get_dates(col_a, max_days):
+        return [today - timedelta(days=i) for i in range(max_days - 1, -1, -1)] if len(col_a) < 10 else [today - timedelta(days=1), today]
 
-    stress_dates = get_hourly_dates(stress_col_a)
-    hr_dates = get_hourly_dates(hr_col_a)
-    steps_dates = get_hourly_dates(steps_col_a)
+    sleep_candidates = [today] if max(0, len(sleep_col_a) - 1) >= 60 else [today - timedelta(days=i) for i in range(59, -1, -1)]
+    sleep_dates_needed = [dt for dt in sleep_candidates if dt.strftime("%Y-%m-%d") not in sleep_col_a]
+    act_start = today - timedelta(days=1 if max(0, len(act_col_a) - 1) >= 60 else 59)
 
-    # Connect to Garmin
+    hourly_dates = get_dates(stress_col_a, 7)
+    snap_dates = get_dates(snap_col_a, 60)
+    sub_sleep_dates = get_dates(stages_col_a, 7)
+
+    # 2. Connect to Garmin
     garmin = get_garmin_client()
 
-    # Sync Sleep
+    # Sync Sleep Summary
     if sleep_dates_needed:
-        logging.info(f"Fetching sleep data for {len(sleep_dates_needed)} date(s)...")
+        logging.info(f"Fetching sleep summary for {len(sleep_dates_needed)} date(s)...")
         for dt in sleep_dates_needed:
             t_date = dt.strftime("%Y-%m-%d")
             try:
@@ -362,13 +481,10 @@ def main():
                 else:
                     sleep_ws.append_row(row)
                     sleep_col_a.append(t_date)
-                logging.info(f"Saved sleep for {t_date}")
             time.sleep(0.2)
-    else:
-        logging.info("Sleep data is up to date.")
 
     # Sync Activities
-    logging.info(f"Fetching activities from {act_start} to {today}...")
+    logging.info("Fetching activities...")
     try:
         activities = garmin.get_activities_by_date(act_start.strftime("%Y-%m-%d"), today.strftime("%Y-%m-%d")) or []
     except Exception as e:
@@ -378,32 +494,32 @@ def main():
     for act in activities:
         act_id = str(act.get("activityId"))
         row = parse_act_row(act)
-
         if act_id in act_col_a:
             idx = act_col_a.index(act_id) + 1
             act_ws.update(f"A{idx}:O{idx}", [row])
-            logging.info(f"Updated activity {act_id}")
         else:
             act_ws.append_row(row)
             act_col_a.append(act_id)
-            logging.info(f"Appended new activity {act_id}")
 
-    # Sync Stress
-    logging.info("Processing hourly stress data...")
-    stress_rows = process_stress_data(garmin, stress_dates)
-    upsert_hourly_data(stress_ws, stress_col_a, stress_rows, STRESS_HEADERS)
+    # Sync Hourly Datasets (Stress, HR, Steps)
+    logging.info("Syncing Stress, HR, Steps...")
+    upsert_data(stress_ws, stress_col_a, process_stress_data(garmin, hourly_dates), STRESS_HEADERS)
+    upsert_data(hr_ws, hr_col_a, process_hr_data(garmin, hourly_dates), HR_HEADERS)
+    upsert_data(steps_ws, steps_col_a, process_steps_data(garmin, hourly_dates), STEPS_HEADERS)
 
-    # Sync Heart Rate
-    logging.info("Processing hourly heart rate data...")
-    hr_rows = process_hr_data(garmin, hr_dates)
-    upsert_hourly_data(hr_ws, hr_col_a, hr_rows, HR_HEADERS)
+    # Sync Health Snapshots (60 days backfill)
+    logging.info("Syncing Health Snapshots...")
+    upsert_data(snap_ws, snap_col_a, fetch_health_snapshots(garmin, snap_dates), SNAPSHOTS_HEADERS)
 
-    # Sync Steps
-    logging.info("Processing hourly steps data...")
-    steps_rows = process_steps_data(garmin, steps_dates)
-    upsert_hourly_data(steps_ws, steps_col_a, steps_rows, STEPS_HEADERS)
+    # Sync Sub-Sleep Breakdown (Stages, Movement, Breathing, Restless)
+    logging.info("Syncing Sleep Stages, Movement, Breathing, Restless Moments...")
+    st_rows, mov_rows, br_rows, rest_rows = process_sub_sleep_data(garmin, sub_sleep_dates)
+    upsert_data(stages_ws, stages_col_a, st_rows, STAGES_HEADERS)
+    upsert_data(move_ws, move_col_a, mov_rows, MOVEMENT_HEADERS)
+    upsert_data(breath_ws, breath_col_a, br_rows, BREATHING_HEADERS)
+    upsert_data(restless_ws, restless_col_a, rest_rows, RESTLESS_HEADERS)
 
-    logging.info("Garmin Sync (Sleep, Activities, Stress, HR, Steps) completed successfully.")
+    logging.info("Garmin Sync complete across all tabs.")
 
 
 if __name__ == "__main__":
