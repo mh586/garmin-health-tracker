@@ -23,6 +23,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Restore or Cache Garmin Tokens
+        uses: actions/cache@v4
+        with:
+          path: /tmp/garmin_tokens
+          key: garmin-tokens-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            garmin-tokens-${{ runner.os }}-
+
       - name: Decode Google Service Account Credentials
         run: |
           echo "${{ secrets.GOOGLE_CREDENTIALS_JSON }}" | base64 --decode > /tmp/gsa.json
