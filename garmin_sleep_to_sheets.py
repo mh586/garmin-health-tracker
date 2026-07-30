@@ -3,7 +3,7 @@ import json
 import logging
 import os
 import sys
-from datetime import date, timedelta
+from datetime import date
 
 from garminconnect import (
     Garmin,
@@ -88,7 +88,8 @@ def get_gspread_client() -> gspread.Client:
 
 
 def main():
-    target_date = (date.today() - timedelta(days=1)).strftime("%Y-%m-%d")
+    # Garmin indexes sleep sessions by the date you wake up (today's date)
+    target_date = date.today().strftime("%Y-%m-%d")
     logging.info(f"Target date for sleep data: {target_date}")
 
     garmin = get_garmin_client()
