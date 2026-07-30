@@ -37,7 +37,7 @@ HEADERS = [
 def get_garmin_client() -> Garmin:
     email = os.environ.get("GARMIN_EMAIL")
     password = os.environ.get("GARMIN_PASSWORD")
-    token_dir = "/tmp/garth_tokens"
+    token_dir = "/tmp/garmin_tokens"
 
     if not email or not password:
         logging.error("GARMIN_EMAIL and GARMIN_PASSWORD environment variables are required.")
@@ -45,16 +45,23 @@ def get_garmin_client() -> Garmin:
 
     try:
         garmin = Garmin(email=email, password=password)
-        if os.path.exists(token_dir):
-            logging.info("Logging into Garmin using cached tokens...")
-            garmin.login(token_dir)
-        else:
-            logging.info("Logging into Garmin with credentials...")
-            garmin.login()
-            garmin.garth.dump(token_dir)
+        logging.info("Authenticating with Garmin Connect...")
+        garmin.login(tokenstore=token_dir)
         return garmin
+    except GarminConnectTooManyRequestsError:
+        logging.error(
+            "Garmin API rate limit reached (HTTP 429). GitHub runner IP is temporarily throttled by Garmin. "
+            "Wait 2–4 hours before re-running."
+        )
+        sys.exit(1)
     except Exception as e:
         err_msg = str(e)
+        if "429" in err_msg or "rate limit" in err_msg.lower():
+            logging.error(
+                "Garmin API rate limit reached (HTTP 429). GitHub runner IP is temporarily throttled by Garmin. "
+                "Wait 2–4 hours before re-running."
+            )
+            sys.exit(1)
         if any(term in err_msg for term in ["MFA", "mfa", "2FA", "2fa", "MFARequired"]):
             logging.error("Garmin MFA is not supported in automated pipelines. Disable MFA on your Garmin account.")
             sys.exit(1)
