@@ -3,7 +3,8 @@ import json
 import logging
 import os
 import sys
-from datetime import date
+import time
+from datetime import date, timedelta
 
 from garminconnect import (
     Garmin,
@@ -49,18 +50,12 @@ def get_garmin_client() -> Garmin:
         garmin.login(tokenstore=token_dir)
         return garmin
     except GarminConnectTooManyRequestsError:
-        logging.error(
-            "Garmin API rate limit reached (HTTP 429). GitHub runner IP is temporarily throttled by Garmin. "
-            "Wait 2–4 hours before re-running."
-        )
+        logging.error("Garmin API rate limit reached (HTTP 429). Wait 2–4 hours before re-running.")
         sys.exit(1)
     except Exception as e:
         err_msg = str(e)
         if "429" in err_msg or "rate limit" in err_msg.lower():
-            logging.error(
-                "Garmin API rate limit reached (HTTP 429). GitHub runner IP is temporarily throttled by Garmin. "
-                "Wait 2–4 hours before re-running."
-            )
+            logging.error("Garmin API rate limit reached (HTTP 429). Wait 2–4 hours before re-running.")
             sys.exit(1)
         if any(term in err_msg for term in ["MFA", "mfa", "2FA", "2fa", "MFARequired"]):
             logging.error("Garmin MFA is not supported in automated pipelines. Disable MFA on your Garmin account.")
@@ -87,23 +82,10 @@ def get_gspread_client() -> gspread.Client:
     return gspread.service_account_from_dict(creds_dict)
 
 
-def main():
-    # Garmin indexes sleep sessions by the date you wake up (today's date)
-    target_date = date.today().strftime("%Y-%m-%d")
-    logging.info(f"Target date for sleep data: {target_date}")
-
-    garmin = get_garmin_client()
-
-    try:
-        sleep_data = garmin.get_sleep_data(target_date)
-    except Exception as e:
-        logging.error(f"Error fetching sleep data from Garmin: {e}")
-        sys.exit(1)
-
+def parse_sleep_row(target_date: str, sleep_data: dict) -> list:
     dto = (sleep_data or {}).get("dailySleepDTO")
     if not dto:
-        logging.warning(f"No sleep data returned from Garmin for {target_date}.")
-        sys.exit(0)
+        return []
 
     scores = dto.get("sleepScores") or {}
     overall_score = scores.get("overall") or {}
@@ -125,16 +107,17 @@ def main():
         "resting_heart_rate": sleep_data.get("restingHeartRate") or dto.get("restingHeartRate"),
         "body_battery_change": sleep_data.get("bodyBatteryChange") or dto.get("bodyBatteryChange"),
     }
+    return [row_dict.get(h) if row_dict.get(h) is not None else "" for h in HEADERS]
 
-    row_values = [row_dict.get(h) if row_dict.get(h) is not None else "" for h in HEADERS]
 
+def main():
     spreadsheet_id = os.environ.get("SPREADSHEET_ID")
     sheet_name = os.environ.get("SHEET_NAME", "Sleep")
-
     if not spreadsheet_id:
         logging.error("SPREADSHEET_ID environment variable is missing.")
         sys.exit(1)
 
+    # 1. Connect to Google Sheets first to check existing records
     gc = get_gspread_client()
     sh = gc.open_by_key(spreadsheet_id)
 
@@ -150,13 +133,51 @@ def main():
     else:
         col_a = worksheet.col_values(1)
 
-    if target_date in col_a:
-        row_idx = col_a.index(target_date) + 1
-        worksheet.update(f"A{row_idx}:O{row_idx}", [row_values])
-        logging.info(f"Updated existing row {row_idx} for date {target_date}.")
+    data_rows_count = max(0, len(col_a) - 1)
+    today = date.today()
+
+    # 2. Determine candidate dates to pull
+    if data_rows_count >= 60:
+        candidate_dates = [today]
     else:
-        worksheet.append_row(row_values)
-        logging.info(f"Appended new row for date {target_date}.")
+        candidate_dates = [today - timedelta(days=i) for i in range(59, -1, -1)]
+
+    # 3. Filter out dates that are already recorded in Google Sheet
+    dates_to_fetch = [dt for dt in candidate_dates if dt.strftime("%Y-%m-%d") not in col_a]
+
+    if not dates_to_fetch:
+        logging.info("Target sleep data is already recorded in Google Sheet. Skipping Garmin API pull.")
+        sys.exit(0)
+
+    logging.info(f"Found {len(dates_to_fetch)} missing date(s). Connecting to Garmin to fetch...")
+
+    # 4. Authenticate with Garmin ONLY when missing data needs to be pulled
+    garmin = get_garmin_client()
+
+    for dt in dates_to_fetch:
+        target_date = dt.strftime("%Y-%m-%d")
+        try:
+            sleep_data = garmin.get_sleep_data(target_date)
+        except Exception as e:
+            logging.error(f"Error fetching sleep data for {target_date}: {e}")
+            continue
+
+        row_values = parse_sleep_row(target_date, sleep_data)
+        if not row_values:
+            logging.warning(f"No sleep data returned from Garmin for {target_date}.")
+            continue
+
+        if target_date in col_a:
+            row_idx = col_a.index(target_date) + 1
+            worksheet.update(f"A{row_idx}:O{row_idx}", [row_values])
+            logging.info(f"Updated row {row_idx} for date {target_date}.")
+        else:
+            worksheet.append_row(row_values)
+            col_a.append(target_date)
+            logging.info(f"Appended new row for date {target_date}.")
+
+        if len(dates_to_fetch) > 1:
+            time.sleep(0.2)
 
 
 if __name__ == "__main__":
