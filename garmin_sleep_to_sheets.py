@@ -8,7 +8,8 @@ from datetime import date, timedelta
 from garminconnect import (
     Garmin,
     GarminConnectAuthenticationError,
-    GarminConnectMfaRequiredError,
+    GarminConnectConnectionError,
+    GarminConnectTooManyRequestsError,
 )
 import gspread
 
@@ -52,11 +53,9 @@ def get_garmin_client() -> Garmin:
             garmin.login()
             garmin.garth.dump(token_dir)
         return garmin
-    except GarminConnectMfaRequiredError:
-        logging.error("Garmin MFA is not supported in automated pipelines. Disable MFA on your Garmin account.")
-        sys.exit(1)
     except Exception as e:
-        if "MFA" in str(e) or "mfa" in str(e):
+        err_msg = str(e)
+        if any(term in err_msg for term in ["MFA", "mfa", "2FA", "2fa", "MFARequired"]):
             logging.error("Garmin MFA is not supported in automated pipelines. Disable MFA on your Garmin account.")
             sys.exit(1)
         logging.error(f"Failed to authenticate with Garmin Connect: {e}")
