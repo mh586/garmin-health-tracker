@@ -18,10 +18,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 
 # Header Definitions
 SLEEP_HEADERS = [
-    "date", "sleep_start_timestamp_local", "sleep_end_timestamp_local",
-    "total_sleep_seconds", "deep_sleep_seconds", "light_sleep_seconds",
-    "rem_sleep_seconds", "awake_seconds", "sleep_score",
-    "sleep_score_qualifier", "avg_overnight_hrv", "avg_spo2_value",
+    "date", "sleep_start_timestamp_local", "sleep_end_timestamp_local", "total_sleep_seconds",
+    "deep_sleep_seconds", "light_sleep_seconds", "rem_sleep_seconds", "awake_seconds",
+    "sleep_score", "sleep_score_qualifier", "avg_overnight_hrv", "avg_spo2_value",
     "avg_respiration_value", "resting_heart_rate", "body_battery_change",
 ]
 
@@ -36,10 +35,7 @@ STRESS_HEADERS = ["date_hour", "min_stress", "max_stress", "avg_stress"]
 HR_HEADERS = ["date_hour", "min_hr", "max_hr", "avg_hr"]
 STEPS_HEADERS = ["date_hour", "total_steps"]
 
-SNAPSHOTS_HEADERS = [
-    "snapshot_id", "timestamp_local", "avg_hr", "avg_stress",
-    "avg_respiration", "spo2", "rmssd", "sdnn",
-]
+SNAPSHOTS_HEADERS = ["snapshot_id", "timestamp_local", "avg_hr", "avg_stress", "avg_respiration", "spo2", "rmssd", "sdnn"]
 STAGES_HEADERS = ["start_time_local", "end_time_local", "stage", "duration_seconds"]
 MOVEMENT_HEADERS = ["date_hour", "min_movement", "max_movement", "avg_movement"]
 BREATHING_HEADERS = ["timestamp_local", "respiration_rate"]
@@ -60,8 +56,8 @@ def get_garmin_client() -> Garmin:
         return garmin
     except Exception as e:
         err_msg = str(e)
-        if any(term in err_msg.lower() for term in ["429", "rate limit"]):
-            logging.error("Garmin rate limit (429) hit. Wait 2-4 hours.")
+        if "429" in err_msg or "rate limit" in err_msg.lower():
+            logging.error("Garmin rate limit hit. Wait 2-4 hours.")
         elif any(term in err_msg for term in ["MFA", "mfa", "2FA", "2fa"]):
             logging.error("Garmin MFA required. Disable MFA on Garmin account.")
         else:
@@ -129,48 +125,54 @@ def get_incremental_dates(col_a, max_backfill_days):
 
 def upsert_data(ws, col_a, row_data_dict, headers):
     """
-    Advanced Upsert: Compares new data against existing sheet content 
-    to prevent redundant API Write requests.
+    Implements: 
+    1. Newest data at top (Row 2)
+    2. Strict type integrity (Numbers as numbers)
+    3. Deduplication & Skip Unchanged (Diff check)
     """
     if not row_data_dict:
         return
 
-    # 1. Pull all current values in the sheet once to allow comparison
     all_existing_values = ws.get_all_values()
-    
-    # 2. Build a map of { "Primary_Key": [list_of_row_values] }
     existing_row_map = {}
     if len(all_existing_values) > 1:
-        for row in all_existing_values[1:]: # Skip header
-            if row:
-                existing_row_map[str(row[0])] = row
+        for row in all_existing_values[1:]:
+            if row: existing_row_map[str(row[0])] = row
 
-    new_rows = []
     end_col_letter = chr(ord("A") + len(headers) - 1)
+    
+    # To maintain Column A tracking correctly during inserts, we sort keys to process
+    # But we must handle updates first, then inserts.
+    keys_to_update = []
+    keys_to_insert = []
 
-    for key in sorted(row_data_dict.keys()):
-        key_str = str(key)
-        # Ensure we are comparing strings to strings
-        new_vals = [str(v) if v is not None else "" for v in row_data_dict[key]]
-
-        if key_str in existing_row_map:
-            old_vals = existing_row_map[key_str]
-            # Compare current row with new data
-            if new_vals != old_vals:
-                idx = col_a.index(key_str) + 1
-                ws.update(f"A{idx}:{end_col_letter}{idx}", [new_vals])
-                time.sleep(0.15) # Throttling to avoid 429
-                logging.info(f"Updated {ws.title} for key {key_str}")
-            else:
-                logging.info(f"Skipped unchanged row in {ws.title} for {key_str}")
+    for key in row_data_dict.keys():
+        if str(key) in existing_row_map:
+            keys_to_update.append(key)
         else:
-            new_rows.append(new_vals)
-            col_a.append(key_str)
+            keys_to_insert.append(key)
 
-    if new_rows:
-        ws.append_rows(new_rows)
+    # 1. Handle Updates (In-place)
+    for key in keys_to_update:
+        key_str = str(key)
+        new_vals = [v if v is not None else "" for v in row_data_dict[key]]
+        # Convert everything to string for the comparison only
+        new_vals_str = [str(v) for v in new_vals]
+        
+        if new_vals_str != existing_row_map[key_str]:
+            idx = col_a.index(key_str) + 1
+            ws.update(f"A{idx}:{end_col_letter}{idx}", [new_vals])
+            time.sleep(0.15)
+            logging.info(f"Updated {ws.title} for {key_str}")
+
+    # 2. Handle Inserts (Newest at Top)
+    for key in keys_to_insert:
+        key_str = str(key)
+        new_vals = [v if v is not None else "" for v in row_data_dict[key]]
+        ws.insert_row(new_vals, 2)
+        col_a.insert(1, key_str)
         time.sleep(0.15)
-        logging.info(f"Appended {len(new_rows)} new rows to {ws.title}")
+        logging.info(f"Inserted NEW row at top of {ws.title} for {key_str}")
 
 
 def parse_sleep_row(target_date: str, sleep_data: dict) -> list:
@@ -220,26 +222,24 @@ def fetch_health_snapshots(garmin, dates):
     for dt in dates:
         date_str = dt.strftime("%Y-%m-%d")
         try:
-            if hasattr(garmin, "get_health_snapshot"):
-                data = garmin.get_health_snapshot(date_str)
-            else:
-                data = garmin.connectapi(f"/healthsnapshot-service/snapshot/daily/{date_str}")
-        except Exception as e:
-            logging.error(f"Error fetching health snapshots for {date_str}: {e}")
-            continue
-        snapshots = data if isinstance(data, list) else (data.get("summaries") or data.get("snapshotList") or [])
-        for item in snapshots:
-            if isinstance(item, dict):
+            # More robust snapshot fetching
+            data = garmin.get_health_snapshot(date_str)
+            if not data: continue
+            snapshots = data if isinstance(data, list) else (data.get("summaries") or data.get("snapshotList") or [])
+            for item in snapshots:
+                if not isinstance(item, dict): continue
                 snap_id = str(item.get("snapshotId") or item.get("summaryId") or item.get("startTimestampLocal") or item.get("startTimestampGMT"))
                 if not snap_id: continue
                 ts = item.get("startTimestampLocal") or item.get("startTimestampGMT") or item.get("startTimeLocal")
                 avg_hr = item.get("averageHeartRate") or item.get("avgHeartRate")
                 avg_stress = item.get("averageStress") or item.get("avgStress")
                 avg_resp = item.get("averageRespiration") or item.get("avgRespiration")
-                spo2 = item.get("spo2") or item.get("averageSpo2")
+                spo2 = item.get("spo2") or item.get("averageSpO2")
                 rmssd = item.get("rmssd") or item.get("hrvRmssd")
                 sdnn = item.get("sdnn") or item.get("hrvSdnn")
-                rows[snap_id] = [snap_id, ts or "", avg_hr if avg_hr is not None else "", avg_stress if avg_stress is not None else "", avg_resp if avg_resp is not None else "", spo2 if spo2 is not None else "", rmssd if rmssd is not None else "", sdnn if sdnn is not None else ""]
+                rows[snap_id] = [snap_id, ts or "", avg_hr, avg_stress, avg_resp, spo2, rmssd, sdnn]
+        except Exception as e:
+            logging.error(f"Snapshot error {date_str}: {e}")
     return rows
 
 
@@ -250,43 +250,34 @@ def process_sub_sleep_data(garmin, dates):
         try:
             data = garmin.get_sleep_data(date_str) or {}
         except Exception as e:
-            logging.error(f"Error fetching detailed sleep for {date_str}: {e}")
+            logging.error(f"Sub-sleep error {date_str}: {e}")
             continue
         # 1. Stages
-        levels_map = data.get("sleepLevels") or (data.get("dailySleepDTO") or {}).get("sleepLevels") or {}
-        stage_items = []
+        dto = data.get("dailySleepDTO") or {}
+        levels_map = dto.get("sleepLevels") or data.get("sleepLevels") or {}
         if isinstance(levels_map, dict):
             for stage_name, items in levels_map.items():
                 if isinstance(items, list):
                     for it in items:
                         if isinstance(it, dict):
-                            it_copy = dict(it); it_copy["stage"] = stage_name; stage_items.append(it_copy)
-        elif isinstance(levels_map, list): stage_items = levels_map
-        for it in stage_items:
-            if isinstance(it, dict):
-                start = it.get("startLocal") or it.get("startTimeLocal") or it.get("startGMT")
-                end = it.get("endLocal") or it.get("endTimeLocal") or it.get("endGMT")
-                stage = it.get("stage") or it.get("activityLevel") or it.get("level") or "unknown"
-                dur = it.get("durationInSeconds") or it.get("duration") or 0
-                if start:
-                    key = str(start)
-                    stages_rows[key] = [key, end or "", stage, dur]
-        # 2. Breathing
-        resp = data.get("sleepRespiration") or data.get("respirationValues") or data.get("epochRespiration") or []
+                            start = it.get("startLocal") or it.get("startTimeLocal") or it.get("startGMT")
+                            end = it.get("endLocal") or it.get("endTimeLocal") or it.get("endGMT")
+                            dur = it.get("durationInSeconds") or it.get("duration") or 0
+                            if start: stages_rows[str(start)] = [str(start), end or "", stage_name, dur]
+        # 2. Breathing (Improved Key Search)
+        resp = dto.get("respirationValues") or data.get("sleepRespiration") or data.get("respirationValues") or []
         for it in resp if isinstance(resp, list) else []:
             if isinstance(it, dict):
                 ts = it.get("startGMT") or it.get("startLocal") or it.get("timestamp")
                 val = it.get("respirationRate") or it.get("value") or it.get("epochValue")
-                if ts and val is not None:
-                    key = str(ts); breathing_rows[key] = [key, val]
+                if ts and val is not None: breathing_rows[str(ts)] = [str(ts), val]
         # 3. Restless
-        restless = data.get("restlessMoments") or data.get("sleepRestlessMoments") or (data.get("dailySleepDTO") or {}).get("restlessMoments") or []
+        restless = dto.get("restlessMoments") or data.get("restlessMoments") or []
         for it in restless if isinstance(restless, list) else []:
             if isinstance(it, dict):
                 ts = it.get("startGMT") or it.get("startLocal") or it.get("timestamp")
                 val = it.get("duration") or it.get("value") or 1
-                if ts:
-                    key = str(ts); restless_rows[key] = [key, val]
+                if ts: restless_rows[str(ts)] = [str(ts), val]
     return stages_rows, breathing_rows, restless_rows
 
 
@@ -297,7 +288,7 @@ def process_sleep_movement(garmin, dates):
         try:
             data = garmin.get_sleep_data(date_str) or {}
         except Exception as e:
-            logging.error(f"Error fetching sleep movement for {date_str}: {e}")
+            logging.error(f"Movement error {date_str}: {e}")
             continue
         movements = data.get("sleepMovement") or data.get("sleepMovementValues") or (data.get("dailySleepDTO") or {}).get("sleepMovement") or []
         for it in movements if isinstance(movements, list) else []:
@@ -323,7 +314,7 @@ def process_stress_data(garmin, dates):
         try:
             data = garmin.get_stress_data(date_str) or {}
         except Exception as e:
-            logging.error(f"Error fetching stress for {date_str}: {e}")
+            logging.error(f"Stress error {date_str}: {e}")
             continue
         raw = data.get("stressValuesArray") or (data.get("userBodyMap") or {}).get("stressValuesArray") or []
         for item in raw:
@@ -348,7 +339,7 @@ def process_hr_data(garmin, dates):
         try:
             data = garmin.get_heart_rates(date_str) or {}
         except Exception as e:
-            logging.error(f"Error fetching heart rates for {date_str}: {e}")
+            logging.error(f"HR error {date_str}: {e}")
             continue
         raw = data.get("heartRateValues") or (data.get("userBodyMap") or {}).get("heartRateValues") or []
         for item in raw:
@@ -373,7 +364,7 @@ def process_steps_data(garmin, dates):
         try:
             data = garmin.get_steps_data(date_str) or []
         except Exception as e:
-            logging.error(f"Error fetching steps for {date_str}: {e}")
+            logging.error(f"Steps error {date_str}: {e}")
             continue
         raw = data if isinstance(data, list) else (data.get("stepItems") or data.get("stepsValuesArray") or [])
         for item in raw:
@@ -414,6 +405,9 @@ def main():
     restless_ws, restless_col_a = sync_sheet(sh, os.environ.get("RESTLESS_SHEET_NAME", "Restless Moments"), RESTLESS_HEADERS)
 
     # Calculate incremental windows
+    def get_inc(col_a, max_d):
+        return [today - timedelta(days=i) for i in range(max_d - 1, -1, -1)] if len(col_a) < 10 else [today - timedelta(days=1), today]
+
     sleep_dates = get_incremental_dates(sleep_col_a, 60)
     act_dates = get_incremental_dates(act_col_a, 60)
     hourly_dates = get_incremental_dates(stress_col_a, 7)
@@ -427,9 +421,8 @@ def main():
 
     garmin = get_garmin_client()
 
-    # Sync Sleep Summary
+    # Sync Sleep
     if sleep_dates:
-        logging.info(f"Syncing Sleep summary ({len(sleep_dates)} dates)...")
         sleep_rows = {}
         for dt in sleep_dates:
             t_date = dt.strftime("%Y-%m-%d")
@@ -437,34 +430,33 @@ def main():
                 data = garmin.get_sleep_data(t_date)
                 row = parse_sleep_row(t_date, data)
                 if row: sleep_rows[t_date] = row
-            except Exception as e: logging.error(f"Error sleep {t_date}: {e}")
+            except Exception as e: logging.error(f"Sleep error {t_date}: {e}")
             time.sleep(0.2)
         upsert_data(sleep_ws, sleep_col_a, sleep_rows, SLEEP_HEADERS)
 
     # Sync Activities
     if act_dates:
         act_start, act_end = min(act_dates), max(act_dates)
-        logging.info(f"Syncing Activities ({act_start} to {act_end})...")
         try:
             activities = garmin.get_activities_by_date(act_start.strftime("%Y-%m-%d"), act_end.strftime("%Y-%m-%d")) or []
             act_rows = {str(a.get("activityId")): parse_act_row(a) for a in activities}
             upsert_data(act_ws, act_col_a, act_rows, ACT_HEADERS)
-        except Exception as e: logging.error(f"Error activities: {e}")
+        except Exception as e: logging.error(f"Act error: {e}")
 
-    # Sync Hourly / Granular
-    logging.info("Syncing Hourly/Granular datasets...")
+    # Sync Hourly/Granular
     upsert_data(stress_ws, stress_col_a, process_stress_data(garmin, hourly_dates), STRESS_HEADERS)
     upsert_data(hr_ws, hr_col_a, process_hr_data(garmin, hr_dates), HR_HEADERS)
     upsert_data(steps_ws, steps_col_a, process_steps_data(garmin, steps_dates), STEPS_HEADERS)
     upsert_data(snap_ws, snap_col_a, fetch_health_snapshots(garmin, snap_dates), SNAPSHOTS_HEADERS)
 
+    # Sub-Sleep
     st_rows, br_rows, rest_rows = process_sub_sleep_data(garmin, stages_dates)
     upsert_data(stages_ws, stages_col_a, st_rows, STAGES_HEADERS)
     upsert_data(breath_ws, breath_col_a, br_rows, BREATHING_HEADERS)
     upsert_data(restless_ws, restless_col_a, rest_rows, RESTLESS_HEADERS)
     upsert_data(move_ws, move_col_a, process_sleep_movement(garmin, move_dates), MOVEMENT_HEADERS)
 
-    logging.info("All Garmin Sync tasks completed.")
+    logging.info("Garmin Sync complete.")
 
 if __name__ == "__main__":
     main()
