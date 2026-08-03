@@ -137,29 +137,62 @@ def get_incremental_dates(col_a, max_backfill_days):
     return [effective_start + timedelta(days=i) for i in range(days_to_fetch + 1)]
 
 
+def parse_dt(s):
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d", "%m/%d/%Y %H:%M:%S", "%m/%d/%Y %H:%M"):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError: continue
+    if "T" in s:
+        s_clean = s.replace("T", " ").split(".")[0]
+        try:
+            return datetime.strptime(s_clean, "%Y-%m-%d %H:%M:%S")
+        except ValueError: pass
+    return None
+
+
+def val_to_num(val):
+    if val is None or val == "": return None
+    try:
+        return float(str(val).replace(",", "."))
+    except ValueError: return None
+
+
+def cells_are_equal(v1, v2):
+    """
+    Semantic Cell Evaluator: Resolves spreadsheet auto-formatting mismatches
+    (e.g., date formats, trailing seconds, decimals, and leading/trailing spaces).
+    """
+    s1 = str(v1).strip() if v1 is not None else ""
+    s2 = str(v2).strip() if v2 is not None else ""
+    
+    if s1 == s2: return True
+    if not s1 and not s2: return True
+    if not s1 or not s2: return False
+
+    # 1. Compare Datetime formats semantically
+    dt1, dt2 = parse_dt(s1), parse_dt(s2)
+    if dt1 and dt2: return dt1 == dt2
+
+    # 2. Compare numerical columns with margin tolerances
+    n1, n2 = val_to_num(v1), val_to_num(v2)
+    if n1 is not None and n2 is not None:
+        return abs(n1 - n2) < 0.05
+
+    return s1.lower() == s2.lower()
+
+
 def rows_are_equal(new_vals, existing_vals, length):
-    """
-    Normalizes and compares existing Sheet rows against Garmin data.
-    Accounts for float formatting (43.0 vs 43) and stripped blank cells.
-    """
-    # 1. Normalize Google Sheet row values
-    ext_normalized = [str(x).strip() for x in existing_vals]
-    while len(ext_normalized) < length:
-        ext_normalized.append("")
-    ext_normalized = ext_normalized[:length]
+    ext_row = list(existing_vals)
+    while len(ext_row) < length: ext_row.append("")
+    ext_row = ext_row[:length]
 
-    # 2. Normalize Garmin values (strip trailing float .0s)
-    new_normalized = []
-    for v in new_vals[:length]:
-        if v is None:
-            s = ""
-        elif isinstance(v, float):
-            s = str(int(v)) if v.is_integer() else str(v)
-        else:
-            s = str(v)
-        new_normalized.append(s.strip())
+    new_row = list(new_vals)
+    while len(new_row) < length: new_row.append("")
+    new_row = new_row[:length]
 
-    return new_normalized == ext_normalized
+    for v1, v2 in zip(new_row, ext_row):
+        if not cells_are_equal(v1, v2): return False
+    return True
 
 
 def upsert_data(ws, col_a, row_data_dict, headers):
@@ -250,7 +283,7 @@ def fetch_health_snapshots(garmin, dates):
     for dt in dates:
         date_str = dt.strftime("%Y-%m-%d")
         try:
-            # REST call directly, bypasses library API differences
+            # Connect REST API directly to solve missing class methods
             data = garmin.connectapi(f"/healthsnapshot-service/snapshot/daily/{date_str}")
             if not data: continue
             snapshots = data if isinstance(data, list) else (data.get("summaries") or data.get("snapshotList") or data.get("snapshots") or [])
