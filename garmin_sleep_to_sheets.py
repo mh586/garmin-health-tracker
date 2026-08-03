@@ -91,10 +91,6 @@ def to_date_hour(ts):
 
 
 def find_key_recursive(d, target_substring):
-    """
-    Recursively scans the API payload for keys matching a substring.
-    Guarantees compatibility across changing Garmin API schemas.
-    """
     if isinstance(d, dict):
         for k, v in d.items():
             if target_substring.lower() in k.lower() and isinstance(v, list) and v:
@@ -134,7 +130,6 @@ def get_incremental_dates(col_a, max_backfill_days):
     if not recorded_dates:
         return [today - timedelta(days=i) for i in range(max_backfill_days - 1, -1, -1)]
     
-    # Ignore future records to keep chronological checks clean
     latest_recorded = max(recorded_dates)
     effective_start = min(latest_recorded, today)
     
@@ -156,7 +151,7 @@ def upsert_data(ws, col_a, row_data_dict, headers):
         if str(key) in existing_row_map: keys_to_update.append(key)
         else: keys_to_insert.append(key)
 
-    # 1. Update existing entries in-place
+    # 1. Update existing entries in-place (if changed)
     for key in keys_to_update:
         key_str = str(key)
         new_vals = [v if v is not None else "" for v in row_data_dict[key]]
@@ -166,14 +161,19 @@ def upsert_data(ws, col_a, row_data_dict, headers):
             time.sleep(0.15)
             logging.info(f"Updated {ws.title} row {idx} for {key_str}")
 
-    # 2. Insert new entries immediately below header (Row 2), sorted ascending
-    for key in sorted(keys_to_insert, reverse=False):
-        key_str = str(key)
-        new_vals = [v if v is not None else "" for v in row_data_dict[key]]
-        ws.insert_row(new_vals, 2)
-        col_a.insert(1, key_str)
+    # 2. Bulk Insert new entries below header (Row 2) - EXACTLY 1 API call
+    if keys_to_insert:
+        sorted_keys = sorted(keys_to_insert, reverse=True)
+        rows_to_insert = []
+        for key in sorted_keys:
+            key_str = str(key)
+            new_vals = [v if v is not None else "" for v in row_data_dict[key]]
+            rows_to_insert.append(new_vals)
+            col_a.insert(1, key_str)
+
+        ws.insert_rows(rows_to_insert, row=2)
         time.sleep(0.15)
-        logging.info(f"Inserted NEW row at top of {ws.title} for {key_str}")
+        logging.info(f"Bulk inserted {len(rows_to_insert)} rows at top of {ws.title}")
 
 
 def parse_sleep_row(target_date: str, sleep_data: dict) -> list:
@@ -236,7 +236,7 @@ def fetch_health_snapshots(garmin, dates):
                     item.get("averageHeartRate") or item.get("avgHeartRate"),
                     item.get("averageStress") or item.get("avgStress"),
                     item.get("averageRespiration") or item.get("avgRespiration"),
-                    item.get("spo2") or item.get("averageSpo2"),
+                    item.get("spo2") or item.get("averageSpO2"),
                     item.get("rmssd") or item.get("hrvRmssd"),
                     item.get("sdnn") or item.get("hrvSdnn"),
                 ]
@@ -256,7 +256,7 @@ def process_sub_sleep_data(garmin, dates):
             continue
         dto = data.get("dailySleepDTO") or {}
         
-        # 1. Sleep Stages Aggressive Scanner
+        # 1. Stages
         levels_map = find_key_recursive(data, "sleepLevel") or find_key_recursive(data, "sleepStage") or dto.get("sleepLevels") or data.get("sleepLevels") or {}
         if isinstance(levels_map, dict):
             for stage_name, items in levels_map.items():
@@ -266,7 +266,7 @@ def process_sub_sleep_data(garmin, dates):
                             start = it.get("startLocal") or it.get("startTimeLocal") or it.get("startGMT")
                             if start: stages_rows[str(start)] = [str(start), it.get("endLocal") or it.get("endTimeLocal") or "", stage_name, it.get("durationInSeconds") or it.get("duration") or 0]
 
-        # 2. Respiration Rate Aggressive Scanner
+        # 2. Respiration Rate (Aggressive Scanner)
         respiration_data = find_key_recursive(data, "respiration") or find_key_recursive(data, "breath") or dto.get("respirationValues") or []
         if isinstance(respiration_data, dict): respiration_data = respiration_data.get("values") or []
         for it in respiration_data if isinstance(respiration_data, list) else []:
@@ -278,7 +278,7 @@ def process_sub_sleep_data(garmin, dates):
                 ts, val = it[0], it[1]
             if ts and val is not None: breathing_rows[str(ts)] = [str(ts), val]
 
-        # 3. Restless Moments Aggressive Scanner
+        # 3. Restless Moments (Aggressive Scanner)
         restless = find_key_recursive(data, "restless") or find_key_recursive(data, "movement") or dto.get("restlessMoments") or []
         for it in restless if isinstance(restless, list) else []:
             if isinstance(it, dict):
@@ -418,10 +418,8 @@ def main():
         for row in all_sleep_values[1:]:
             if row:
                 date_key = row[0]
-                # If Column A has a date but columns B onwards are completely empty
                 if not any(row[1:]):
                     empty_sleep_dates.append(date_key)
-                    # Force a re-fetch of these empty nights
                     if date_key in sleep_col_a:
                         sleep_col_a.remove(date_key)
 
@@ -433,7 +431,7 @@ def main():
     past_5_days = [today - timedelta(days=i) for i in range(5)]
     act_dates = list(set(act_dates_incremental + past_5_days))
 
-    # Detailed tables always fetch the past 7 days (the smart upsert logic makes this quota-safe!)
+    # Detailed tables fetch the past 7 days
     sub_sleep_dates = [today - timedelta(days=i) for i in range(7)]
     hourly_dates = [today - timedelta(days=i) for i in range(7)]
     snap_dates = [today - timedelta(days=i) for i in range(60)]
@@ -451,7 +449,6 @@ def main():
                 if row: 
                     sleep_rows[t_date] = row
                 else:
-                    # Clear out the empty placeholder row if no Garmin sleep data exists
                     if t_date in empty_sleep_dates:
                         try:
                             all_rows = sleep_ws.get_all_values()
