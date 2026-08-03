@@ -108,11 +108,16 @@ def get_incremental_dates(col_a, max_backfill_days):
             date_part = str(key).split(" ")[0].split("T")[0]
             recorded_dates.append(datetime.strptime(date_part, "%Y-%m-%d").date())
         except ValueError: continue
+    
     if not recorded_dates:
         return [today - timedelta(days=i) for i in range(max_backfill_days - 1, -1, -1)]
-    latest_date = max(recorded_dates)
-    days_to_fetch = max(1, (today - latest_date).days)
-    return [latest_date + timedelta(days=i) for i in range(days_to_fetch + 1)]
+    
+    # FIX: Ignore dates in the future to prevent blocking the fetch loop
+    latest_recorded = max(recorded_dates)
+    effective_start = min(latest_recorded, today)
+    
+    days_to_fetch = max(1, (today - effective_start).days)
+    return [effective_start + timedelta(days=i) for i in range(days_to_fetch + 1)]
 
 def upsert_data(ws, col_a, row_data_dict, headers):
     if not row_data_dict: return
@@ -145,14 +150,23 @@ def upsert_data(ws, col_a, row_data_dict, headers):
 def parse_sleep_row(target_date: str, sleep_data: dict) -> list:
     dto = (sleep_data or {}).get("dailySleepDTO")
     if not dto: return []
+    
+    # QUALITY GATE: Only proceed if there is actually sleep recorded
+    # If total_sleep_seconds is missing or 0, we treat this as a 'no-sleep' day and skip the row
+    total_sleep = dto.get("sleepTimeSeconds")
+    sleep_score = (dto.get("sleepScores") or {}).get("overall", {}).get("value") or dto.get("sleepScore")
+    if not total_sleep and not sleep_score:
+        logging.info(f"No meaningful sleep data for {target_date}. Skipping row.")
+        return []
+
     scores = dto.get("sleepScores") or {}
     overall = scores.get("overall") or {}
     row_dict = {
         "date": target_date, "sleep_start_timestamp_local": dto.get("sleepStartTimestampLocal") or dto.get("startTimestampLocal"),
         "sleep_end_timestamp_local": dto.get("sleepEndTimestampLocal") or dto.get("endTimestampLocal"),
-        "total_sleep_seconds": dto.get("sleepTimeSeconds"), "deep_sleep_seconds": dto.get("deepSleepSeconds"),
+        "total_sleep_seconds": total_sleep, "deep_sleep_seconds": dto.get("deepSleepSeconds"),
         "light_sleep_seconds": dto.get("lightSleepSeconds"), "rem_sleep_seconds": dto.get("remSleepSeconds"),
-        "awake_seconds": dto.get("awakeSleepSeconds"), "sleep_score": overall.get("value") or dto.get("sleepScore"),
+        "awake_seconds": dto.get("awakeSleepSeconds"), "sleep_score": sleep_score,
         "sleep_score_qualifier": overall.get("qualifierKey") or dto.get("sleepScoreQualifier"),
         "avg_overnight_hrv": sleep_data.get("avgOvernightHrv") or dto.get("avgOvernightHrv"),
         "avg_spo2_value": sleep_data.get("averageSpO2Value") or dto.get("averageSpO2Value"),
@@ -172,7 +186,8 @@ def parse_act_row(act: dict) -> list:
         "elapsed_duration_seconds": act.get("elapsedDuration"), "moving_duration_seconds": act.get("movingDuration"),
         "average_speed_mps": act.get("averageSpeed"), "max_speed_mps": act.get("maxSpeed"),
         "calories": act.get("calories"), "average_hr": act.get("averageHR"),
-        "max_hr": act.get("maxHR"), "steps": act.get("steps"), "elevation_gain_meters": act.get("elevationGain"),
+        "max_hr": act.get("maxHR"), "steps": act.get("steps"),
+        "elevation_gain_meters": act.get("elevationGain"),
     }
     return [row_dict.get(h) if row_dict.get(h) is not None else "" for h in ACT_HEADERS]
 
@@ -183,12 +198,7 @@ def fetch_health_snapshots(garmin, dates):
         try:
             data = garmin.get_health_snapshot(date_str)
             if not data: continue
-            # Aggressive check for snapshots list
-            snapshots = []
-            if isinstance(data, list): snapshots = data
-            elif isinstance(data, dict):
-                snapshots = data.get("summaries") or data.get("snapshotList") or data.get("snapshots") or []
-            
+            snapshots = data if isinstance(data, list) else (data.get("summaries") or data.get("snapshotList") or data.get("snapshots") or [])
             for item in snapshots:
                 if not isinstance(item, dict): continue
                 snap_id = str(item.get("snapshotId") or item.get("summaryId") or item.get("startTimestampLocal") or item.get("startTimestampGMT"))
@@ -217,7 +227,6 @@ def process_sub_sleep_data(garmin, dates):
             logging.error(f"Sub-sleep error {date_str}: {e}")
             continue
         dto = data.get("dailySleepDTO") or {}
-        # 1. Stages
         levels_map = dto.get("sleepLevels") or data.get("sleepLevels") or {}
         if isinstance(levels_map, dict):
             for stage_name, items in levels_map.items():
@@ -226,7 +235,6 @@ def process_sub_sleep_data(garmin, dates):
                         if isinstance(it, dict):
                             start = it.get("startLocal") or it.get("startTimeLocal") or it.get("startGMT")
                             if start: stages_rows[str(start)] = [str(start), it.get("endLocal") or it.get("endTimeLocal") or "", stage_name, it.get("durationInSeconds") or it.get("duration") or 0]
-        # 2. Breathing - Aggressive search for respiration
         respiration_data = dto.get("respirationValues") or data.get("sleepRespiration") or data.get("respirationValues") or dto.get("respiration") or []
         if isinstance(respiration_data, dict): respiration_data = respiration_data.get("values") or []
         for it in respiration_data if isinstance(respiration_data, list) else []:
@@ -237,7 +245,6 @@ def process_sub_sleep_data(garmin, dates):
             elif isinstance(it, (list, tuple)) and len(it) >= 2:
                 ts, val = it[0], it[1]
             if ts and val is not None: breathing_rows[str(ts)] = [str(ts), val]
-        # 3. Restless
         restless = dto.get("restlessMoments") or data.get("restlessMoments") or []
         for it in restless if isinstance(restless, list) else []:
             if isinstance(it, dict):
