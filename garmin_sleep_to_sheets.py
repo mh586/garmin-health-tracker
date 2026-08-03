@@ -137,6 +137,31 @@ def get_incremental_dates(col_a, max_backfill_days):
     return [effective_start + timedelta(days=i) for i in range(days_to_fetch + 1)]
 
 
+def rows_are_equal(new_vals, existing_vals, length):
+    """
+    Normalizes and compares existing Sheet rows against Garmin data.
+    Accounts for float formatting (43.0 vs 43) and stripped blank cells.
+    """
+    # 1. Normalize Google Sheet row values
+    ext_normalized = [str(x).strip() for x in existing_vals]
+    while len(ext_normalized) < length:
+        ext_normalized.append("")
+    ext_normalized = ext_normalized[:length]
+
+    # 2. Normalize Garmin values (strip trailing float .0s)
+    new_normalized = []
+    for v in new_vals[:length]:
+        if v is None:
+            s = ""
+        elif isinstance(v, float):
+            s = str(int(v)) if v.is_integer() else str(v)
+        else:
+            s = str(v)
+        new_normalized.append(s.strip())
+
+    return new_normalized == ext_normalized
+
+
 def upsert_data(ws, col_a, row_data_dict, headers):
     if not row_data_dict: return
     all_existing_values = ws.get_all_values()
@@ -151,17 +176,19 @@ def upsert_data(ws, col_a, row_data_dict, headers):
         if str(key) in existing_row_map: keys_to_update.append(key)
         else: keys_to_insert.append(key)
 
-    # 1. Update existing entries in-place (if changed)
+    # 1. Update existing entries in-place (ONLY if normalized values differ)
     for key in keys_to_update:
         key_str = str(key)
         new_vals = [v if v is not None else "" for v in row_data_dict[key]]
-        if [str(v) for v in new_vals] != existing_row_map[key_str]:
+        if not rows_are_equal(new_vals, existing_row_map[key_str], len(headers)):
             idx = col_a.index(key_str) + 1
             ws.update(f"A{idx}:{end_col_letter}{idx}", [new_vals])
             time.sleep(0.15)
             logging.info(f"Updated {ws.title} row {idx} for {key_str}")
+        else:
+            logging.info(f"Skipped unchanged row in {ws.title} for {key_str}")
 
-    # 2. Bulk Insert new entries below header (Row 2) - EXACTLY 1 API call
+    # 2. Bulk Insert new entries below header (Row 2)
     if keys_to_insert:
         sorted_keys = sorted(keys_to_insert, reverse=True)
         rows_to_insert = []
@@ -223,7 +250,8 @@ def fetch_health_snapshots(garmin, dates):
     for dt in dates:
         date_str = dt.strftime("%Y-%m-%d")
         try:
-            data = garmin.get_health_snapshot(date_str)
+            # REST call directly, bypasses library API differences
+            data = garmin.connectapi(f"/healthsnapshot-service/snapshot/daily/{date_str}")
             if not data: continue
             snapshots = data if isinstance(data, list) else (data.get("summaries") or data.get("snapshotList") or data.get("snapshots") or [])
             for item in snapshots:
