@@ -476,7 +476,7 @@ def main():
     # Sync Hourly/Granular
     upsert_data(stress_ws, stress_col_a, process_stress_data(garmin, hourly_dates), STRESS_HEADERS)
     upsert_data(hr_ws, hr_col_a, process_hr_data(garmin, hourly_dates), HR_HEADERS)
-    upsert_data(steps_ws, steps_col_a, process_steps_data(garmin, steps_dates), STEPS_HEADERS)
+    upsert_data(steps_ws, steps_col_a, process_steps_data(garmin, hourly_dates), STEPS_HEADERS)
     upsert_data(snap_ws, snap_col_a, fetch_health_snapshots(garmin, snap_dates), SNAPSHOTS_HEADERS)
 
     # Detailed Sub-Sleep
