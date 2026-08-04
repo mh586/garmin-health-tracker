@@ -37,6 +37,7 @@ STAGES_HEADERS = ["start_time_local", "end_time_local", "stage", "duration_secon
 MOVEMENT_HEADERS = ["date_hour", "min_movement", "max_movement", "avg_movement"]
 BREATHING_HEADERS = ["date_hour", "min_respiration", "max_respiration", "avg_respiration"]
 RESTLESS_HEADERS = ["date_hour", "min_restless", "max_restless", "avg_restless"]
+BODY_BATTERY_HEADERS = ["date_hour", "min_body_battery", "max_body_battery", "avg_body_battery"]
 
 
 def get_garmin_client() -> Garmin:
@@ -91,10 +92,6 @@ def to_date_hour(ts):
 
 
 def find_val_recursive(d, target_key):
-    """
-    Case-insensitive search for nested API response keys.
-    Works for both single lists, summaries, and complex sub-dictionaries.
-    """
     if isinstance(d, dict):
         for k, v in d.items():
             if k.lower() == target_key.lower(): return v
@@ -121,6 +118,25 @@ def sync_sheet(sh, title, headers):
     return ws, col_a
 
 
+def get_incremental_dates(col_a, max_backfill_days):
+    today = date.today()
+    recorded_dates = []
+    for key in col_a[1:]:
+        if not key: continue
+        try:
+            date_part = str(key).split(" ")[0].split("T")[0]
+            recorded_dates.append(datetime.strptime(date_part, "%Y-%m-%d").date())
+        except ValueError: continue
+    if not recorded_dates:
+        return [today - timedelta(days=i) for i in range(max_backfill_days - 1, -1, -1)]
+    
+    latest_recorded = max(recorded_dates)
+    effective_start = min(latest_recorded, today)
+    
+    days_to_fetch = max(1, (today - effective_start).days)
+    return [effective_start + timedelta(days=i) for i in range(days_to_fetch + 1)]
+
+
 def rows_are_equal(new_vals, existing_vals, length):
     ext_row = list(existing_vals)
     while len(ext_row) < length: ext_row.append("")
@@ -131,13 +147,11 @@ def rows_are_equal(new_vals, existing_vals, length):
     new_row = new_row[:length]
 
     for v1, v2 in zip(new_row, ext_row):
-        # Semantic Cell Comparison (Timezones and floating numbers)
         s1 = str(v1).strip() if v1 is not None else ""
         s2 = str(v2).strip() if v2 is not None else ""
         if s1 == s2 or (not s1 and not s2): continue
         if not s1 or not s2: return False
 
-        # DateTime match
         parsed_matched = False
         for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d", "%m/%d/%Y %H:%M:%S"):
             try:
@@ -146,7 +160,6 @@ def rows_are_equal(new_vals, existing_vals, length):
             except ValueError: continue
         if parsed_matched: continue
 
-        # Float tolerance margin
         try:
             n1, n2 = float(s1.replace(",", ".")), float(s2.replace(",", "."))
             if abs(n1 - n2) < 0.05: continue
@@ -203,7 +216,8 @@ def parse_sleep_row(target_date: str, sleep_data: dict) -> list:
     
     total_sleep = dto.get("sleepTimeSeconds")
     sleep_score = (dto.get("sleepScores") or {}).get("overall", {}).get("value") or dto.get("sleepScore")
-    if not total_sleep and not sleep_score: return []
+    if not total_sleep and not sleep_score:
+        return []
 
     scores = dto.get("sleepScores") or {}
     overall = scores.get("overall") or {}
@@ -422,6 +436,31 @@ def process_steps_data(garmin, dates):
     return rows
 
 
+def process_body_battery_data(garmin, dates):
+    hourly_buckets = {}
+    for dt in dates:
+        date_str = dt.strftime("%Y-%m-%d")
+        try:
+            data = garmin.get_body_battery(date_str) or []
+            raw = data if isinstance(data, list) else (find_val_recursive(data, "bodyBatteryValuesArray") or find_val_recursive(data, "values") or [])
+            for item in raw if isinstance(raw, list) else []:
+                ts, val = None, None
+                if isinstance(item, dict):
+                    ts = item.get("timestamp") or item.get("startTimestampGMT") or item.get("startGMT")
+                    val = item.get("bodyBatteryValue") or item.get("value")
+                elif isinstance(item, (list, tuple)) and len(item) >= 3:
+                    ts = item[0]
+                    val = item[2]
+                if ts is not None and val is not None and isinstance(val, (int, float)) and 0 <= val <= 100:
+                    dh = to_date_hour(ts)
+                    if dh: hourly_buckets.setdefault(dh, []).append(val)
+        except Exception as e: logging.error(f"Body battery error {date_str}: {e}")
+    rows = {}
+    for dh, vals in hourly_buckets.items():
+        if vals: rows[dh] = [dh, min(vals), max(vals), round(sum(vals) / len(vals), 1)]
+    return rows
+
+
 def main():
     spreadsheet_id = os.environ.get("SPREADSHEET_ID")
     if not spreadsheet_id:
@@ -443,6 +482,7 @@ def main():
     move_ws, move_col_a = sync_sheet(sh, os.environ.get("MOVEMENT_SHEET_NAME", "Sleep Movement"), MOVEMENT_HEADERS)
     breath_ws, breath_col_a = sync_sheet(sh, os.environ.get("BREATHING_SHEET_NAME", "Breathing Disruption"), BREATHING_HEADERS)
     restless_ws, restless_col_a = sync_sheet(sh, os.environ.get("RESTLESS_SHEET_NAME", "Restless Moments"), RESTLESS_HEADERS)
+    bb_ws, bb_col_a = sync_sheet(sh, os.environ.get("BODY_BATTERY_SHEET_NAME", "Body Battery"), BODY_BATTERY_HEADERS)
 
     # SELF-HEALING: Locate placeholder rows that contain only dates but no sleep summary data
     all_sleep_values = sleep_ws.get_all_values()
@@ -460,10 +500,10 @@ def main():
     candidate_sleep_dates = [today - timedelta(days=i) for i in range(59, -1, -1)]
     sleep_dates = [dt for dt in candidate_sleep_dates if dt.strftime("%Y-%m-%d") not in sleep_col_a or dt == today]
     
-    # Sync Activities for the past 14 days to capture any unrecorded workouts
+    # Sync Activities for the past 14 days
     act_dates = [today - timedelta(days=i) for i in range(13, -1, -1)]
 
-    # Detailed sub-sleep tables and hourly datasets fetch the past 7 days (Quota-safe comparative sync)
+    # Detailed tables fetch the past 7 days (Quota-safe comparative sync)
     sub_sleep_dates = [today - timedelta(days=i) for i in range(7)]
     hourly_dates = [today - timedelta(days=i) for i in range(7)]
     snap_dates = [today - timedelta(days=i) for i in range(60)]
@@ -510,11 +550,13 @@ def main():
     upsert_data(hr_ws, hr_col_a, process_hr_data(garmin, hourly_dates), HR_HEADERS)
     upsert_data(steps_ws, steps_col_a, process_steps_data(garmin, hourly_dates), STEPS_HEADERS)
     upsert_data(snap_ws, snap_col_a, fetch_health_snapshots(garmin, snap_dates), SNAPSHOTS_HEADERS)
+    upsert_data(bb_ws, bb_col_a, process_body_battery_data(garmin, hourly_dates), BODY_BATTERY_HEADERS)
 
-    # Detailed Sub-Sleep and Hourly sleep metrics
-    upsert_data(stages_ws, stages_col_a, process_sleep_stages(garmin, sub_sleep_dates), STAGES_HEADERS)
-    upsert_data(breath_ws, breath_col_a, process_breathing_disruptions(garmin, sub_sleep_dates), BREATHING_HEADERS)
-    upsert_data(restless_ws, restless_col_a, process_restless_moments(garmin, sub_sleep_dates), RESTLESS_HEADERS)
+    # Detailed Sub-Sleep
+    st_rows, br_rows, rest_rows = process_sub_sleep_data(garmin, sub_sleep_dates)
+    upsert_data(stages_ws, stages_col_a, st_rows, STAGES_HEADERS)
+    upsert_data(breath_ws, breath_col_a, br_rows, BREATHING_HEADERS)
+    upsert_data(restless_ws, restless_col_a, rest_rows, RESTLESS_HEADERS)
     upsert_data(move_ws, move_col_a, process_sleep_movement(garmin, sub_sleep_dates), MOVEMENT_HEADERS)
 
     logging.info("Garmin Sync complete.")
