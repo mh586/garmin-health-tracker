@@ -144,6 +144,26 @@ def get_incremental_dates(col_a, max_backfill_days):
     return [effective_start + timedelta(days=i) for i in range(days_to_fetch + 1)]
 
 
+def parse_dt(s):
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d", "%m/%d/%Y %H:%M:%S", "%m/%d/%Y %H:%M"):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError: continue
+    if "T" in s:
+        s_clean = s.replace("T", " ").split(".")[0]
+        try:
+            return datetime.strptime(s_clean, "%Y-%m-%d %H:%M:%S")
+        except ValueError: pass
+    return None
+
+
+def val_to_num(val):
+    if val is None or val == "": return None
+    try:
+        return float(str(val).replace(",", "."))
+    except ValueError: return None
+
+
 def cells_are_equal(v1, v2):
     s1 = str(v1).strip() if v1 is not None else ""
     s2 = str(v2).strip() if v2 is not None else ""
@@ -269,7 +289,7 @@ def fetch_health_snapshots(garmin, dates):
     for dt in dates:
         date_str = dt.strftime("%Y-%m-%d")
         try:
-            # Direct REST api, fully version-independent
+            # Direct REST API call
             data = garmin.connectapi(f"/healthsnapshot-service/snapshot/daily/{date_str}")
             if not data: continue
             snapshots = data if isinstance(data, list) else (find_val_recursive(data, "summaries") or find_val_recursive(data, "snapshotList") or find_val_recursive(data, "snapshots") or [])
@@ -303,13 +323,41 @@ def process_sleep_stages(garmin, dates):
         try:
             data = garmin.get_sleep_data(date_str) or {}
             levels_map = find_val_recursive(data, "sleepLevels") or find_val_recursive(data, "sleepLevel") or find_val_recursive(data, "sleepStage") or {}
-            if isinstance(levels_map, dict):
+            
+            # Garmin sleepLevels is represented as a flat list of dictionaries
+            if isinstance(levels_map, list):
+                for it in levels_map:
+                    if isinstance(it, dict):
+                        start = it.get("startGMT") or it.get("startLocal") or it.get("startTimeLocal")
+                        end = it.get("endGMT") or it.get("endLocal") or it.get("endTimeLocal")
+                        stage = it.get("activityLevel") or it.get("stage") or "unknown"
+                        
+                        if isinstance(stage, (int, float)):
+                            stage_map = {0: "awake", 1: "light", 2: "deep", 3: "rem"}
+                            stage = stage_map.get(int(stage), str(stage))
+                        
+                        dur = 0
+                        if start and end:
+                            try:
+                                dt_start = parse_dt(str(start))
+                                dt_end = parse_dt(str(end))
+                                if dt_start and dt_end:
+                                    dur = int((dt_end - dt_start).total_seconds())
+                            except Exception: pass
+                        
+                        if start:
+                            stages_rows[str(start)] = [str(start), end or "", str(stage), dur]
+                            
+            elif isinstance(levels_map, dict):
                 for stage_name, items in levels_map.items():
                     if isinstance(items, list):
                         for it in items:
                             if isinstance(it, dict):
                                 start = it.get("startLocal") or it.get("startTimeLocal") or it.get("startGMT")
-                                if start: stages_rows[str(start)] = [str(start), it.get("endLocal") or it.get("endTimeLocal") or "", stage_name, it.get("durationInSeconds") or it.get("duration") or 0]
+                                end = it.get("endLocal") or it.get("endTimeLocal") or it.get("endGMT")
+                                dur = it.get("durationInSeconds") or it.get("duration") or 0
+                                if start:
+                                    stages_rows[str(start)] = [str(start), end or "", str(stage_name), dur]
         except Exception as e:
             err_msg = str(e)
             if "404" in err_msg or "not found" in err_msg.lower():
