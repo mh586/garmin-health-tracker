@@ -17,9 +17,11 @@ import gspread
 # Configure Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# Silence noisy internal logging from the third-party Garmin libraries
-logging.getLogger("garminconnect").setLevel(logging.WARNING)
-logging.getLogger("garth").setLevel(logging.WARNING)
+# Completely silence noisy internal logging and tracebacks from the third-party Garmin libraries
+for logger_name in ("garminconnect", "garth"):
+    lgr = logging.getLogger(logger_name)
+    lgr.setLevel(logging.CRITICAL)
+    lgr.propagate = False
 
 # Header Definitions
 SLEEP_HEADERS = [
@@ -267,6 +269,7 @@ def fetch_health_snapshots(garmin, dates):
     for dt in dates:
         date_str = dt.strftime("%Y-%m-%d")
         try:
+            # Direct REST api, fully version-independent
             data = garmin.connectapi(f"/healthsnapshot-service/snapshot/daily/{date_str}")
             if not data: continue
             snapshots = data if isinstance(data, list) else (find_val_recursive(data, "summaries") or find_val_recursive(data, "snapshotList") or find_val_recursive(data, "snapshots") or [])
