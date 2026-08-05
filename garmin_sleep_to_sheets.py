@@ -137,6 +137,29 @@ def get_incremental_dates(col_a, max_backfill_days):
     return [effective_start + timedelta(days=i) for i in range(days_to_fetch + 1)]
 
 
+def cells_are_equal(v1, v2):
+    s1 = str(v1).strip() if v1 is not None else ""
+    s2 = str(v2).strip() if v2 is not None else ""
+    
+    if s1 == s2 or (not s1 and not s2): return True
+    if not s1 or not s2: return False
+
+    parsed_matched = False
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d", "%m/%d/%Y %H:%M:%S"):
+        try:
+            dt1, dt2 = datetime.strptime(s1.replace("T", " ").split(".")[0], fmt), datetime.strptime(s2.replace("T", " ").split(".")[0], fmt)
+            if dt1 == dt2: parsed_matched = True; break
+        except ValueError: continue
+    if parsed_matched: return True
+
+    try:
+        n1, n2 = float(s1.replace(",", ".")), float(s2.replace(",", "."))
+        if abs(n1 - n2) < 0.05: return True
+    except ValueError: pass
+
+    return s1.lower() == s2.lower()
+
+
 def rows_are_equal(new_vals, existing_vals, length):
     ext_row = list(existing_vals)
     while len(ext_row) < length: ext_row.append("")
@@ -147,25 +170,7 @@ def rows_are_equal(new_vals, existing_vals, length):
     new_row = new_row[:length]
 
     for v1, v2 in zip(new_row, ext_row):
-        s1 = str(v1).strip() if v1 is not None else ""
-        s2 = str(v2).strip() if v2 is not None else ""
-        if s1 == s2 or (not s1 and not s2): continue
-        if not s1 or not s2: return False
-
-        parsed_matched = False
-        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d", "%m/%d/%Y %H:%M:%S"):
-            try:
-                dt1, dt2 = datetime.strptime(s1.replace("T", " ").split(".")[0], fmt), datetime.strptime(s2.replace("T", " ").split(".")[0], fmt)
-                if dt1 == dt2: parsed_matched = True; break
-            except ValueError: continue
-        if parsed_matched: continue
-
-        try:
-            n1, n2 = float(s1.replace(",", ".")), float(s2.replace(",", "."))
-            if abs(n1 - n2) < 0.05: continue
-        except ValueError: pass
-
-        if s1.lower() != s2.lower(): return False
+        if not cells_are_equal(v1, v2): return False
     return True
 
 
@@ -183,7 +188,6 @@ def upsert_data(ws, col_a, row_data_dict, headers):
         if str(key) in existing_row_map: keys_to_update.append(key)
         else: keys_to_insert.append(key)
 
-    # 1. Update existing entries in-place (ONLY if normalized values differ)
     for key in keys_to_update:
         key_str = str(key)
         new_vals = [v if v is not None else "" for v in row_data_dict[key]]
@@ -195,7 +199,6 @@ def upsert_data(ws, col_a, row_data_dict, headers):
         else:
             logging.info(f"Skipped unchanged row in {ws.title} for {key_str}")
 
-    # 2. Bulk Insert new entries below header (Row 2)
     if keys_to_insert:
         sorted_keys = sorted(keys_to_insert, reverse=True)
         rows_to_insert = []
@@ -275,7 +278,11 @@ def fetch_health_snapshots(garmin, dates):
                     item.get("sdnn") or item.get("hrvSdnn"),
                 ]
         except Exception as e:
-            logging.error(f"Snapshot error {date_str}: {e}")
+            err_msg = str(e)
+            if "404" in err_msg or "not found" in err_msg.lower():
+                logging.info(f"No Health Snapshots recorded on {date_str}.")
+            else:
+                logging.error(f"Snapshot error {date_str}: {e}")
     return rows
 
 
@@ -293,7 +300,12 @@ def process_sleep_stages(garmin, dates):
                             if isinstance(it, dict):
                                 start = it.get("startLocal") or it.get("startTimeLocal") or it.get("startGMT")
                                 if start: stages_rows[str(start)] = [str(start), it.get("endLocal") or it.get("endTimeLocal") or "", stage_name, it.get("durationInSeconds") or it.get("duration") or 0]
-        except Exception as e: logging.error(f"Stages error {date_str}: {e}")
+        except Exception as e:
+            err_msg = str(e)
+            if "404" in err_msg or "not found" in err_msg.lower():
+                logging.info(f"No sleep stages exists on {date_str}.")
+            else:
+                logging.error(f"Stages error {date_str}: {e}")
     return stages_rows
 
 
@@ -313,7 +325,12 @@ def process_sleep_movement(garmin, dates):
                 if ts and val is not None and isinstance(val, (int, float)):
                     dh = to_date_hour(ts)
                     if dh: hourly_buckets.setdefault(dh, []).append(val)
-        except Exception as e: logging.error(f"Movement error {date_str}: {e}")
+        except Exception as e:
+            err_msg = str(e)
+            if "404" in err_msg or "not found" in err_msg.lower():
+                logging.info(f"No sleep movement exists on {date_str}.")
+            else:
+                logging.error(f"Movement error {date_str}: {e}")
     rows = {}
     for dh, vals in hourly_buckets.items():
         if vals: rows[dh] = [dh, min(vals), max(vals), round(sum(vals) / len(vals), 1)]
@@ -337,7 +354,12 @@ def process_breathing_disruptions(garmin, dates):
                 if ts and val is not None and isinstance(val, (int, float)):
                     dh = to_date_hour(ts)
                     if dh: hourly_buckets.setdefault(dh, []).append(val)
-        except Exception as e: logging.error(f"Breathing error {date_str}: {e}")
+        except Exception as e:
+            err_msg = str(e)
+            if "404" in err_msg or "not found" in err_msg.lower():
+                logging.info(f"No respiration data exists on {date_str}.")
+            else:
+                logging.error(f"Breathing error {date_str}: {e}")
     rows = {}
     for dh, vals in hourly_buckets.items():
         if vals: rows[dh] = [dh, min(vals), max(vals), round(sum(vals) / len(vals), 1)]
@@ -360,7 +382,12 @@ def process_restless_moments(garmin, dates):
                 if ts and val is not None and isinstance(val, (int, float)):
                     dh = to_date_hour(ts)
                     if dh: hourly_buckets.setdefault(dh, []).append(val)
-        except Exception as e: logging.error(f"Restless error {date_str}: {e}")
+        except Exception as e:
+            err_msg = str(e)
+            if "404" in err_msg or "not found" in err_msg.lower():
+                logging.info(f"No restless moments data exists on {date_str}.")
+            else:
+                logging.error(f"Restless error {date_str}: {e}")
     rows = {}
     for dh, vals in hourly_buckets.items():
         if vals: rows[dh] = [dh, min(vals), max(vals), round(sum(vals) / len(vals), 1)]
@@ -383,7 +410,12 @@ def process_stress_data(garmin, dates):
                 if ts is not None and val is not None and isinstance(val, (int, float)) and val >= 0:
                     dh = to_date_hour(ts)
                     if dh: hourly_buckets.setdefault(dh, []).append(val)
-        except Exception as e: logging.error(f"Stress error {date_str}: {e}")
+        except Exception as e:
+            err_msg = str(e)
+            if "404" in err_msg or "not found" in err_msg.lower():
+                logging.info(f"No stress data exists on {date_str}.")
+            else:
+                logging.error(f"Stress error {date_str}: {e}")
     rows = {}
     for dh, vals in hourly_buckets.items():
         if vals: rows[dh] = [dh, min(vals), max(vals), round(sum(vals) / len(vals), 1)]
@@ -406,7 +438,12 @@ def process_hr_data(garmin, dates):
                 if ts is not None and val is not None and isinstance(val, (int, float)) and val > 0:
                     dh = to_date_hour(ts)
                     if dh: hourly_buckets.setdefault(dh, []).append(val)
-        except Exception as e: logging.error(f"HR error {date_str}: {e}")
+        except Exception as e:
+            err_msg = str(e)
+            if "404" in err_msg or "not found" in err_msg.lower():
+                logging.info(f"No heart rates exists on {date_str}.")
+            else:
+                logging.error(f"HR error {date_str}: {e}")
     rows = {}
     for dh, vals in hourly_buckets.items():
         if vals: rows[dh] = [dh, min(vals), max(vals), round(sum(vals) / len(vals), 1)]
@@ -429,7 +466,12 @@ def process_steps_data(garmin, dates):
                 if ts is not None and isinstance(steps, (int, float)) and steps >= 0:
                     dh = to_date_hour(ts)
                     if dh: hourly_buckets[dh] = hourly_buckets.get(dh, 0) + int(steps)
-        except Exception as e: logging.error(f"Steps error {date_str}: {e}")
+        except Exception as e:
+            err_msg = str(e)
+            if "404" in err_msg or "not found" in err_msg.lower():
+                logging.info(f"No steps data exists on {date_str}.")
+            else:
+                logging.error(f"Steps error {date_str}: {e}")
     rows = {}
     for dh, total_steps in hourly_buckets.items():
         rows[dh] = [dh, total_steps]
@@ -454,7 +496,12 @@ def process_body_battery_data(garmin, dates):
                 if ts is not None and val is not None and isinstance(val, (int, float)) and 0 <= val <= 100:
                     dh = to_date_hour(ts)
                     if dh: hourly_buckets.setdefault(dh, []).append(val)
-        except Exception as e: logging.error(f"Body battery error {date_str}: {e}")
+        except Exception as e:
+            err_msg = str(e)
+            if "404" in err_msg or "not found" in err_msg.lower():
+                logging.info(f"No body battery data exists on {date_str}.")
+            else:
+                logging.error(f"Body battery error {date_str}: {e}")
     rows = {}
     for dh, vals in hourly_buckets.items():
         if vals: rows[dh] = [dh, min(vals), max(vals), round(sum(vals) / len(vals), 1)]
@@ -532,7 +579,11 @@ def main():
                         except Exception as del_err:
                             logging.error(f"Blank cleanup failed for {t_date}: {del_err}")
             except Exception as e: 
-                logging.error(f"Sleep error {t_date}: {e}")
+                err_msg = str(e)
+                if "404" in err_msg or "not found" in err_msg.lower():
+                    logging.info(f"No sleep data exists for {t_date} (404).")
+                else:
+                    logging.error(f"Sleep error {t_date}: {e}")
             time.sleep(0.2)
         upsert_data(sleep_ws, sleep_col_a, sleep_rows, SLEEP_HEADERS)
 
@@ -553,10 +604,9 @@ def main():
     upsert_data(bb_ws, bb_col_a, process_body_battery_data(garmin, hourly_dates), BODY_BATTERY_HEADERS)
 
     # Detailed Sub-Sleep
-    st_rows, br_rows, rest_rows = process_sub_sleep_data(garmin, sub_sleep_dates)
-    upsert_data(stages_ws, stages_col_a, st_rows, STAGES_HEADERS)
-    upsert_data(breath_ws, breath_col_a, br_rows, BREATHING_HEADERS)
-    upsert_data(restless_ws, restless_col_a, rest_rows, RESTLESS_HEADERS)
+    upsert_data(stages_ws, stages_col_a, process_sleep_stages(garmin, sub_sleep_dates), STAGES_HEADERS)
+    upsert_data(breath_ws, breath_col_a, process_breathing_disruptions(garmin, sub_sleep_dates), BREATHING_HEADERS)
+    upsert_data(restless_ws, restless_col_a, process_restless_moments(garmin, sub_sleep_dates), RESTLESS_HEADERS)
     upsert_data(move_ws, move_col_a, process_sleep_movement(garmin, sub_sleep_dates), MOVEMENT_HEADERS)
 
     logging.info("Garmin Sync complete.")
