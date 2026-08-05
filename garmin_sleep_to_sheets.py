@@ -14,7 +14,12 @@ from garminconnect import (
 )
 import gspread
 
+# Configure Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+# Silence noisy internal logging from the third-party Garmin libraries
+logging.getLogger("garminconnect").setLevel(logging.WARNING)
+logging.getLogger("garth").setLevel(logging.WARNING)
 
 # Header Definitions
 SLEEP_HEADERS = [
@@ -188,6 +193,7 @@ def upsert_data(ws, col_a, row_data_dict, headers):
         if str(key) in existing_row_map: keys_to_update.append(key)
         else: keys_to_insert.append(key)
 
+    # 1. Update existing entries in-place (ONLY if normalized values differ)
     for key in keys_to_update:
         key_str = str(key)
         new_vals = [v if v is not None else "" for v in row_data_dict[key]]
@@ -199,6 +205,7 @@ def upsert_data(ws, col_a, row_data_dict, headers):
         else:
             logging.info(f"Skipped unchanged row in {ws.title} for {key_str}")
 
+    # 2. Bulk Insert new entries below header (Row 2)
     if keys_to_insert:
         sorted_keys = sorted(keys_to_insert, reverse=True)
         rows_to_insert = []
