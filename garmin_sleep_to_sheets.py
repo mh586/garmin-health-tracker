@@ -98,13 +98,24 @@ def to_date_hour(ts):
     return None
 
 
+def to_clean_datetime(ts):
+    """
+    Standardizes timestamps/ISO strings to YYYY-MM-DD HH:MM:SS format
+    to prevent scientific notation formatting in Google Sheets.
+    """
+    if not ts: return ""
+    if isinstance(ts, (int, float)):
+        if ts > 1e11: ts /= 1000.0
+        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(ts, str):
+        try:
+            return to_clean_datetime(float(ts))
+        except ValueError: pass
+        return ts.replace("T", " ").split(".")[0]
+    return str(ts)
+
+
 def find_val_recursive(d, target_key):
-    """
-    Two-tiered priority key locator:
-    1. Looks for exact case-insensitive match.
-    2. Falls back to substring match (e.g. 'sleepLevelsMap' maps to 'sleepLevels').
-    3. Recursively searches nested dicts and lists.
-    """
     if isinstance(d, dict):
         for k, v in d.items():
             if k.lower() == target_key.lower(): return v
@@ -151,6 +162,26 @@ def get_incremental_dates(col_a, max_backfill_days):
     
     days_to_fetch = max(1, (today - effective_start).days)
     return [effective_start + timedelta(days=i) for i in range(days_to_fetch + 1)]
+
+
+def parse_dt(s):
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d", "%m/%d/%Y %H:%M:%S"):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError: continue
+    if "T" in s:
+        s_clean = s.replace("T", " ").split(".")[0]
+        try:
+            return datetime.strptime(s_clean, "%Y-%m-%d %H:%M:%S")
+        except ValueError: pass
+    return None
+
+
+def val_to_num(val):
+    if val is None or val == "": return None
+    try:
+        return float(str(val).replace(",", "."))
+    except ValueError: return None
 
 
 def cells_are_equal(v1, v2):
@@ -204,13 +235,13 @@ def upsert_data(ws, col_a, row_data_dict, headers):
         if str(key) in existing_row_map: keys_to_update.append(key)
         else: keys_to_insert.append(key)
 
-    # 1. Update existing entries in-place (ONLY if normalized values differ)
+    # 1. Update existing entries (Keyword-argument compliant to resolve deprecation)
     for key in keys_to_update:
         key_str = str(key)
         new_vals = [v if v is not None else "" for v in row_data_dict[key]]
         if not rows_are_equal(new_vals, existing_row_map[key_str], len(headers)):
             idx = col_a.index(key_str) + 1
-            ws.update(f"A{idx}:{end_col_letter}{idx}", [new_vals])
+            ws.update(range_name=f"A{idx}:{end_col_letter}{idx}", values=[new_vals])
             time.sleep(0.15)
             logging.info(f"Updated {ws.title} row {idx} for {key_str}")
         else:
@@ -278,7 +309,6 @@ def fetch_health_snapshots(garmin, dates):
     for dt in dates:
         date_str = dt.strftime("%Y-%m-%d")
         try:
-            # Direct REST api, fully version-independent
             data = garmin.connectapi(f"/healthsnapshot-service/snapshot/daily/{date_str}")
             if not data: continue
             snapshots = data if isinstance(data, list) else (find_val_recursive(data, "summaries") or find_val_recursive(data, "snapshotList") or find_val_recursive(data, "snapshots") or [])
@@ -325,16 +355,18 @@ def process_sleep_stages(garmin, dates):
                             stage = stage_map.get(int(stage), str(stage))
                         
                         dur = 0
-                        if start and end:
+                        start_clean = to_clean_datetime(start)
+                        end_clean = to_clean_datetime(end)
+                        if start_clean and end_clean:
                             try:
-                                dt_start = parse_dt(str(start))
-                                dt_end = parse_dt(str(end))
+                                dt_start = parse_dt(start_clean)
+                                dt_end = parse_dt(end_clean)
                                 if dt_start and dt_end:
                                     dur = int((dt_end - dt_start).total_seconds())
                             except Exception: pass
                         
-                        if start:
-                            stages_rows[str(start)] = [str(start), end or "", str(stage), dur]
+                        if start_clean:
+                            stages_rows[start_clean] = [start_clean, end_clean or "", str(stage), dur]
                             
             elif isinstance(levels_map, dict):
                 for stage_name, items in levels_map.items():
@@ -344,8 +376,10 @@ def process_sleep_stages(garmin, dates):
                                 start = it.get("startLocal") or it.get("startTimeLocal") or it.get("startGMT")
                                 end = it.get("endLocal") or it.get("endTimeLocal") or it.get("endGMT")
                                 dur = it.get("durationInSeconds") or it.get("duration") or 0
-                                if start:
-                                    stages_rows[str(start)] = [str(start), end or "", str(stage_name), dur]
+                                start_clean = to_clean_datetime(start)
+                                end_clean = to_clean_datetime(end)
+                                if start_clean:
+                                    stages_rows[start_clean] = [start_clean, end_clean or "", str(stage_name), dur]
         except Exception as e:
             err_msg = str(e)
             if "404" in err_msg or "not found" in err_msg.lower():
@@ -388,16 +422,15 @@ def process_breathing_disruptions(garmin, dates):
     for dt in dates:
         date_str = dt.strftime("%Y-%m-%d")
         try:
-            # Use specific API call for full respiration rate time-series
             data = garmin.get_respiration_data(date_str) or {}
-            raw = find_val_recursive(data, "respirationValuesArray") or find_val_recursive(data, "values") or []
-            for item in raw if isinstance(raw, list) else []:
+            respiration_data = find_val_recursive(data, "respiration") or find_val_recursive(data, "breath") or []
+            if isinstance(respiration_data, dict): respiration_data = respiration_data.get("values") or []
+            for it in respiration_data if isinstance(respiration_data, list) else []:
                 ts, val = None, None
-                if isinstance(item, dict):
-                    ts = item.get("startTimestampGMT") or item.get("timestamp") or item.get("startGMT")
-                    val = item.get("respirationRate") or item.get("value")
-                elif isinstance(item, (list, tuple)) and len(item) >= 2:
-                    ts, val = item[0], item[1]
+                if isinstance(it, dict):
+                    ts = it.get("startGMT") or it.get("startLocal") or it.get("timestamp") or it.get("startTimeLocal")
+                    val = it.get("respirationRate") or it.get("value") or it.get("epochValue")
+                elif isinstance(it, (list, tuple)) and len(it) >= 2: ts, val = item[0], item[1]
                 if ts and val is not None and isinstance(val, (int, float)):
                     dh = to_date_hour(ts)
                     if dh: hourly_buckets.setdefault(dh, []).append(val)
@@ -530,7 +563,6 @@ def process_body_battery_data(garmin, dates):
     for dt in dates:
         date_str = dt.strftime("%Y-%m-%d")
         try:
-            # Multi-parameter syntax
             data = garmin.get_body_battery(date_str, date_str) or []
             raw = data if isinstance(data, list) else (find_val_recursive(data, "bodyBatteryValuesArray") or find_val_recursive(data, "values") or [])
             for item in raw if isinstance(raw, list) else []:
