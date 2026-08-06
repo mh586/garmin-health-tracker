@@ -99,9 +99,18 @@ def to_date_hour(ts):
 
 
 def find_val_recursive(d, target_key):
+    """
+    Two-tiered priority key locator:
+    1. Looks for exact case-insensitive match.
+    2. Falls back to substring match (e.g. 'sleepLevelsMap' maps to 'sleepLevels').
+    3. Recursively searches nested dicts and lists.
+    """
     if isinstance(d, dict):
         for k, v in d.items():
             if k.lower() == target_key.lower(): return v
+        for k, v in d.items():
+            if target_key.lower() in k.lower(): return v
+        for k, v in d.items():
             res = find_val_recursive(v, target_key)
             if res is not None: return res
     elif isinstance(d, list):
@@ -142,26 +151,6 @@ def get_incremental_dates(col_a, max_backfill_days):
     
     days_to_fetch = max(1, (today - effective_start).days)
     return [effective_start + timedelta(days=i) for i in range(days_to_fetch + 1)]
-
-
-def parse_dt(s):
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d", "%m/%d/%Y %H:%M:%S", "%m/%d/%Y %H:%M"):
-        try:
-            return datetime.strptime(s, fmt)
-        except ValueError: continue
-    if "T" in s:
-        s_clean = s.replace("T", " ").split(".")[0]
-        try:
-            return datetime.strptime(s_clean, "%Y-%m-%d %H:%M:%S")
-        except ValueError: pass
-    return None
-
-
-def val_to_num(val):
-    if val is None or val == "": return None
-    try:
-        return float(str(val).replace(",", "."))
-    except ValueError: return None
 
 
 def cells_are_equal(v1, v2):
@@ -289,7 +278,7 @@ def fetch_health_snapshots(garmin, dates):
     for dt in dates:
         date_str = dt.strftime("%Y-%m-%d")
         try:
-            # Direct REST API call
+            # Direct REST api, fully version-independent
             data = garmin.connectapi(f"/healthsnapshot-service/snapshot/daily/{date_str}")
             if not data: continue
             snapshots = data if isinstance(data, list) else (find_val_recursive(data, "summaries") or find_val_recursive(data, "snapshotList") or find_val_recursive(data, "snapshots") or [])
@@ -324,7 +313,6 @@ def process_sleep_stages(garmin, dates):
             data = garmin.get_sleep_data(date_str) or {}
             levels_map = find_val_recursive(data, "sleepLevels") or find_val_recursive(data, "sleepLevel") or find_val_recursive(data, "sleepStage") or {}
             
-            # Garmin sleepLevels is represented as a flat list of dictionaries
             if isinstance(levels_map, list):
                 for it in levels_map:
                     if isinstance(it, dict):
@@ -400,15 +388,16 @@ def process_breathing_disruptions(garmin, dates):
     for dt in dates:
         date_str = dt.strftime("%Y-%m-%d")
         try:
-            data = garmin.get_sleep_data(date_str) or {}
-            respiration_data = find_val_recursive(data, "respiration") or find_val_recursive(data, "breath") or []
-            if isinstance(respiration_data, dict): respiration_data = respiration_data.get("values") or []
-            for it in respiration_data if isinstance(respiration_data, list) else []:
+            # Use specific API call for full respiration rate time-series
+            data = garmin.get_respiration_data(date_str) or {}
+            raw = find_val_recursive(data, "respirationValuesArray") or find_val_recursive(data, "values") or []
+            for item in raw if isinstance(raw, list) else []:
                 ts, val = None, None
-                if isinstance(it, dict):
-                    ts = it.get("startGMT") or it.get("startLocal") or it.get("timestamp") or it.get("startTimeLocal")
-                    val = it.get("respirationRate") or it.get("value") or it.get("epochValue")
-                elif isinstance(it, (list, tuple)) and len(it) >= 2: ts, val = it[0], it[1]
+                if isinstance(item, dict):
+                    ts = item.get("startTimestampGMT") or item.get("timestamp") or item.get("startGMT")
+                    val = item.get("respirationRate") or item.get("value")
+                elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                    ts, val = item[0], item[1]
                 if ts and val is not None and isinstance(val, (int, float)):
                     dh = to_date_hour(ts)
                     if dh: hourly_buckets.setdefault(dh, []).append(val)
@@ -541,7 +530,8 @@ def process_body_battery_data(garmin, dates):
     for dt in dates:
         date_str = dt.strftime("%Y-%m-%d")
         try:
-            data = garmin.get_body_battery(date_str) or []
+            # Multi-parameter syntax
+            data = garmin.get_body_battery(date_str, date_str) or []
             raw = data if isinstance(data, list) else (find_val_recursive(data, "bodyBatteryValuesArray") or find_val_recursive(data, "values") or [])
             for item in raw if isinstance(raw, list) else []:
                 ts, val = None, None
